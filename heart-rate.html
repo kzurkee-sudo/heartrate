@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Heart Rate</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#fff;--fg:#1a1a1a;--mut:#666;--acc:#d32f2f;--card:#f4f4f5}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121212;--fg:#f2f2f2;--mut:#a0a0a0;--acc:#ff6b6b;--card:#1e1e1e}}
+:root[data-theme="dark"]{--bg:#121212;--fg:#f2f2f2;--mut:#a0a0a0;--acc:#ff6b6b;--card:#1e1e1e}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;text-align:center}
+main{max-width:420px;margin:0 auto;padding:24px}
+h1{font-size:1.6rem;margin:8px 0 0}
+#bpm{font-size:5.5rem;font-weight:700;color:var(--acc);line-height:1.1;margin-top:20px}
+.unit{color:var(--mut);letter-spacing:.1em}
+#status{color:var(--mut);min-height:3em;margin:16px 0}
+#bar{width:100%;height:10px;accent-color:var(--acc)}
+canvas{width:100%;height:100px;background:var(--card);border-radius:12px;margin-top:16px}
+button{margin-top:24px;width:100%;padding:16px;font-size:1.1rem;font-weight:600;border:0;border-radius:12px;background:var(--acc);color:#fff}
+small{display:block;margin-top:20px;color:var(--mut)}
+</style>
+</head>
+<body>
+<main>
+<h1>Heart Rate</h1>
+<div id="bpm">--</div>
+<div class="unit">BPM</div>
+<div id="status">Tap Start, then cover the rear camera and the flash together with your fingertip.</div>
+<progress id="bar" max="100" value="0"></progress>
+<canvas id="wave" width="600" height="200"></canvas>
+<button id="btn">Start</button>
+<small>Estimate only. Not a medical device.</small>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const bpmEl=$('bpm'),st=$('status'),bar=$('bar'),btn=$('btn'),cv=$('wave'),cx=cv.getContext('2d');
+const MEASURE=20000;
+let stream=null,track=null,running=false,t0=0,T=[],V=[],recent=[];
+const vid=document.createElement('video');vid.muted=true;vid.playsInline=true;vid.setAttribute('playsinline','');
+const c=document.createElement('canvas');c.width=48;c.height=36;
+const ctx=c.getContext('2d',{willReadFrequently:true});
+const say=s=>st.textContent=s;
+
+btn.onclick=start;
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&running)stop('Stopped (page went to background).')});
+
+async function start(){
+  if(running){stop('Stopped.');return}
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){say('This browser can’t access the camera here. Try Chrome on Android.');return}
+  try{
+    try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{exact:'environment'},width:{ideal:320},height:{ideal:240},frameRate:{ideal:30}},audio:false})}
+    catch(e){stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false})}
+  }catch(e){say('Camera blocked ('+(e.name||'error')+'). Allow camera access for this page and try again.');return}
+  track=stream.getVideoTracks()[0];
+  vid.srcObject=stream;
+  try{await vid.play()}catch(e){}
+  let torch=false;
+  try{const caps=track.getCapabilities?track.getCapabilities():{};
+    if(caps.torch){await track.applyConstraints({advanced:[{torch:true}]});torch=true}}catch(e){}
+  T=[];V=[];recent=[];t0=0;running=true;bar.value=0;bpmEl.textContent='--';btn.textContent='Stop';
+  say(torch?'Cover the camera and flash with your fingertip. Press lightly.':'Couldn’t turn on the flashlight from this browser. Cover the camera with your fingertip in a bright spot.');
+  schedule();
+}
+
+function stop(msg){
+  running=false;
+  try{if(track)track.applyConstraints({advanced:[{torch:false}]}).catch(()=>{})}catch(e){}
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  stream=null;track=null;btn.textContent='Start';
+  if(msg)say(msg);
+}
+
+function schedule(){vid.requestVideoFrameCallback?vid.requestVideoFrameCallback(frame):setTimeout(frame,33)}
+
+function frame(){
+  if(!running)return;
+  ctx.drawImage(vid,0,0,48,36);
+  const d=ctx.getImageData(12,9,24,18).data;
+  let r=0,g=0;const n=d.length/4;
+  for(let i=0;i<d.length;i+=4){r+=d[i];g+=d[i+1]}
+  sample(performance.now(),r/n,g/n);
+  if(running)schedule();
+}
+
+function sample(t,r,g){
+  const finger=r>100&&r>g*1.4;
+  if(!finger){T=[];V=[];t0=0;bar.value=0;recent=[];draw();say('Place your fingertip so it covers BOTH the camera and the flash.');return}
+  if(!t0)t0=t;
+  T.push(t);V.push(r);recent.push(r);if(recent.length>180)recent.shift();
+  const el=t-t0;bar.value=Math.min(100,el*100/MEASURE);
+  say('Measuring… keep still and breathe normally.');
+  draw();
+  if(el>=MEASURE)finish();
+}
+
+function finish(){
+  const b=computeBpm(T,V);
+  stop();
+  if(b){bpmEl.textContent=b;say('Done. Typical resting range is 60–100 BPM.')}
+  else{bar.value=0;say('Couldn’t get a clean reading. Press more lightly, keep still, and try again.')}
+}
+
+function draw(){
+  cx.clearRect(0,0,cv.width,cv.height);
+  if(recent.length<5)return;
+  const m=recent.reduce((a,b)=>a+b,0)/recent.length;
+  const dev=recent.map(x=>x-m);
+  const mx=Math.max(1,...dev.map(Math.abs));
+  cx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--acc').trim()||'#d32f2f';
+  cx.lineWidth=4;cx.beginPath();
+  dev.forEach((x,i)=>{const px=i*cv.width/179,py=cv.height/2-x/mx*cv.height*0.4;i?cx.lineTo(px,py):cx.moveTo(px,py)});
+  cx.stroke();
+}
+
+function computeBpm(t,v){
+  if(t.length<2)return null;
+  const skip=t[0]+3000,ts=[],raw=[];
+  for(let i=0;i<t.length;i++)if(t[i]>=skip){ts.push(t[i]);raw.push(v[i])}
+  const n=raw.length;if(n<100)return null;
+  const fs=(n-1)*1000/(ts[n-1]-ts[0]);
+  const half=Math.max(1,Math.round(fs*0.5));
+  const hp=new Array(n);
+  for(let i=0;i<n;i++){const a=Math.max(0,i-half),b=Math.min(n-1,i+half);let s=0;for(let j=a;j<=b;j++)s+=raw[j];hp[i]=raw[i]-s/(b-a+1)}
+  const sh=Math.max(1,Math.round(fs*0.07)),sm=new Array(n);
+  for(let i=0;i<n;i++){const a=Math.max(0,i-sh),b=Math.min(n-1,i+sh);let s=0;for(let j=a;j<=b;j++)s+=hp[j];sm[i]=s/(b-a+1)}
+  let sq=0;for(const x of sm)sq+=x*x;
+  const thr=0.25*Math.sqrt(sq/n),k=Math.max(2,Math.round(fs*0.3)),peaks=[];
+  for(let i=k;i<n-k;i++){
+    if(sm[i]<thr)continue;let ok=true;
+    for(let j=i-k;j<=i+k;j++){if(j===i)continue;if(sm[j]>sm[i]||(j<i&&sm[j]===sm[i])){ok=false;break}}
+    if(ok)peaks.push(ts[i]);
+  }
+  if(peaks.length<6)return null;
+  const iv=[];for(let i=1;i<peaks.length;i++){const d=peaks[i]-peaks[i-1];if(d>=300&&d<=1500)iv.push(d)}
+  if(iv.length<5)return null;
+  iv.sort((a,b)=>a-b);
+  const bpm=Math.round(60000/iv[Math.floor(iv.length/2)]);
+  return bpm>=40&&bpm<=200?bpm:null;
+}
+</script>
+</body>
+</html>
